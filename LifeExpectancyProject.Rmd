@@ -1,0 +1,434 @@
+---
+title: "STA 141C Data Preprocess"
+output: html_document
+date: "2024-02-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load all the packages
+library(lubridate)
+library(zoo)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(MASS)
+library(gridExtra)
+library(randomForest)
+library(dplyr)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(GGally)
+library(car)
+library(xgboost)
+library(gbm)
+```
+
+
+```{r}
+# Setting up and initial cleaning
+setwd("C:/Users/gaosh/OneDrive/Desktop/STA 141C")
+who <- read.csv("who_life_exp.csv") 
+who_noune <- who[, 1:(ncol(who) - 9)] # Remove all une columns as they are missing most values 
+
+who_noune <- who_noune[,-20] # WHO data without une_ columns
+
+# hospitals and doctors are missing for most countries. hepatitis are missing (NA > 8) for some 
+# important European countries (Norway, UK, etc.). Therefore these three columns are removed. 
+who_noune$hospitals <- NULL
+who_noune$doctors <- NULL
+who_noune$hepatitis <- NULL
+
+# These are dependent variables 
+who_noune$adult_mortality <- NULL
+who_noune$infant_mort <- NULL
+who_noune$age1.4mort <- NULL
+who_noune$life_exp60 <- NULL
+
+# This is for generating a summary table of NAs of each country
+na_summary <- who_noune %>%
+  gather(key = "variable", value = "value", -country) %>%  
+  filter(is.na(value)) %>% # Only count columns with NAs
+  group_by(country, variable) %>%
+  summarise(na_count = n()) %>%
+  spread(key = "variable", value = "na_count") %>%
+  replace(is.na(.), 0)  # Replace NA in the summary with 0, indicating no missing values for that variable
+
+# Write the csv file
+write.csv(na_summary, "na_summary_by_country.csv", row.names = FALSE)
+
+# Count the number of NAs of each country under each columns
+na_summary_long <- na_summary %>%
+  pivot_longer(cols = -country, names_to = "variable", values_to = "na_count")
+
+# Filter to find rows where na_count exceeds 8
+countries_with_excess_nas <- na_summary_long %>%
+  filter(na_count > 8) %>%
+  distinct(country) %>%
+  pull(country)
+
+# use this list to remove these countries from who_noune
+who_cleaned <- who_noune[!who_noune$country %in% countries_with_excess_nas, ]
+
+# List of removed countries for confirmation
+removed_countries_list <- countries_with_excess_nas
+print(removed_countries_list) # 12 countries are removed due to missing data
+```
+
+
+```{r}
+# Here we did some summary and graphs to build an initial understanding of the distribution of the dataset
+summary(who_cleaned)
+
+# We are graphing the numerical columns only. Categorical columns and year columns are removed
+numeric_vars <- sapply(who_cleaned, is.numeric) & names(who_cleaned) != "year"
+numeric_data <- who_cleaned[numeric_vars]
+
+# Plot distributions for the remaining numeric columns
+lapply(names(numeric_data), function(x) {
+  ggplot(who_cleaned, aes_string(x = x)) + 
+    geom_histogram(bins = 30, fill = '#6E91EC', color = 'black') + 
+    theme_minimal() + 
+    ggtitle(paste("Distribution of", x))
+})
+```
+
+```{r}
+# Use linear interpolation within each country to fill in NAs. This method 
+# could possibly be biased when we have consecutive NAs but still is a simple 
+# solution to address the missing data issue
+
+who_cleaned <- who_cleaned %>%
+  group_by(country) %>% # Within each country
+  mutate(across(where(is.numeric), ~ na.approx(.x, na.rm = FALSE, rule = 2))) %>%
+  ungroup()
+
+# Change back to dataframe as dplyr package returns tibbles
+who_cleaned <- as.data.frame(who_cleaned) 
+
+sum(is.na(who_cleaned)) # Double-check all NAs are resolved
+
+write.csv(who_cleaned, "who_cleaned.csv", row.names = FALSE) # Store this dataset
+```
+
+```{r}
+# Remove the first four columns to generate a dataset with numeric values only
+who_cleaned_no_categorical <- who_cleaned[, -c(1:4)]
+
+# Pair plot
+ggpairs(who_cleaned_no_categorical)
+pair_plot <- ggpairs(who_cleaned_no_categorical)
+ggsave("pair_plot.png", plot = pair_plot, width = 18, height = 18) # Save the graph
+```
+
+```{r}
+# Generate the VIF graph and save it as png file
+png("VIF.png", width = 1200, height = 900, res = 150)
+lm_model <- lm(life_expect ~ ., data = who_cleaned_no_categorical)
+vif_results <- vif(lm_model)
+par(mar = c(8, 5, 4, 2) + 0.1)
+barplot(vif_results, main = "VIF Values", horiz = FALSE, col = "steelblue", las = 2, cex.names = 0.7)
+
+# This adds an horizontal line of 5 to better visualize what variables shall be removed due to high VIF values (>5)
+abline(h = 5, lwd = 3, lty = 2) 
+print(vif_results)
+dev.off()
+
+# Remove the variables with high VIF values to address multicollinearity issue 
+who_no_multicol <- dplyr::select(who_cleaned, -polio, -diphtheria, -measles)
+```
+
+```{r}
+# We then examime if the dataset satisfy the assumptions of linear regression 
+lm_model <- lm(life_expect ~ ., data = who_no_multicol)
+# Diagnostic plots after removing variables with high VIF valuess
+par(mfrow = c(2, 2))
+plot(lm_model)
+
+# Have a numeric values only dataset
+who_no_multicol_numeric <- who_no_multicol[ , -(1:4)]
+lm_model_no_multicol_numeric <- lm(life_expect ~ ., data = who_no_multicol_numeric)
+
+# Use absolute residuals to find indices of outliers
+residuals_indices <- which(abs(resid(lm_model_no_multicol_numeric)) > 2*sd(resid(lm_model_no_multicol_numeric)))
+
+# Use leverage values to find indices of outliers
+n <- nrow(who_no_multicol_numeric)  # Number of observations
+p <- length(coef(lm_model_no_multicol_numeric)) - 1  # Number of predictors
+average_leverage_threshold <- 2*(p+1)/n
+leverage_indices <- which(hatvalues(lm_model_no_multicol_numeric) > average_leverage_threshold)
+
+# Use Cook's distance to find indices of outliers
+cooks_distance_indices <- which(cooks.distance(lm_model_no_multicol_numeric) > 4/n)
+
+# Find all unique outliers
+all_outlier_indices <- unique(c(residuals_indices, leverage_indices, cooks_distance_indices))
+
+# Remove all unique outliers
+who_no_multicol_outlier <- who_no_multicol_numeric[-all_outlier_indices, ]
+
+# Diagnostic plots after removing outliers
+lm_model_no_multicol_outlier <- lm(life_expect ~ ., data = who_no_multicol_outlier)
+par(mfrow = c(2, 2))
+plot(lm_model_no_multicol_outlier)
+```
+```{r}
+# Normalization. This model violates assumptions of linear regression so is discarded
+who_normal <- scale(who_no_multicol_outlier)
+who_normal <- as.data.frame(who_normal)
+lm_normal <- lm(life_expect ~ ., data = who_normal)
+summary(lm_normal)
+predictions <- predict(lm_normal, who_normal)
+
+# Diagnostic plots after removing variables with high VIF valuess
+par(mfrow=c(2, 2))
+plot(lm_normal)
+```
+
+```{r}
+# Log transformation. Also violates the assumptions of linear regression and is discarded. 
+who_no_multicol_outlier_log <- who_no_multicol_outlier
+who_no_multicol_outlier_log$log_life_expect <- log(who_no_multicol_outlier$life_expect)
+lm_model_log <- lm(log_life_expect ~ ., data = who_no_multicol_outlier_log)
+summary(lm_model_log)
+par(mfrow = c(2, 2))
+plot(lm_model_log)
+```
+
+```{r}
+# Linear regression with outliers removed
+lm_model_no_multicol_outlier <- lm(life_expect ~ ., data = who_no_multicol_outlier)
+
+# Box-Cox transformation
+boxcox_result <- boxcox(lm_model_no_multicol_outlier)
+
+# Find optimal lambda
+lambda_optimal <- boxcox_result$x[which.max(boxcox_result$y)]
+print(paste("Optimal lambda:", lambda_optimal))
+
+# Apply Box-Cox transformation
+who_boxcox <- who_no_multicol_outlier
+who_boxcox$life_expect_boxcox <- ifelse(lambda_optimal == 0, 
+                                                          log(who_boxcox$life_expect), 
+                                                          ((who_boxcox$life_expect^lambda_optimal) - 1) / lambda_optimal)
+
+# Linear regression on box-cox transformed life_expect
+lm_model_boxcox <- lm(life_expect_boxcox ~ alcohol + bmi + age5.19thinness + age5.19obesity + basic_water + gni_capita + gghe.d + che_gdp, data = who_boxcox)
+predictions_boxcox <- predict(lm_model_boxcox, newdata = who_boxcox)
+if (lambda_optimal == 0) {
+  predictions <- exp(predictions_boxcox)
+} else {
+  predictions <- (predictions_boxcox * lambda_optimal + 1)^(1 / lambda_optimal)
+}
+
+# Calculate RMSE and MAPE
+rmse <- sqrt(mean((predictions - who_boxcox$life_expect)^2))
+mape <- mean(abs((predictions - who_boxcox$life_expect) / who_boxcox$life_expect)) * 100
+cat("RMSE:", rmse, "\n")
+cat("MAPE:", mape, "%\n")
+
+# Display the summary of the transformed model
+summary(lm_model_boxcox)
+par(mfrow=c(2, 2))
+plot(lm_model_boxcox)
+```
+
+```{r}
+# Define a function to calculate RMSE, R^2, and MAPE for 
+calculate_metrics <- function(predictions, test_data) {
+  # Calculate RMSE (Root Mean Square Error)
+  rmse <- sqrt(mean((predictions - test_data$life_expect)^2))
+  
+  # Calculate R-squared
+  r_squared <- cor(test_data$life_expect, predictions)^2
+  
+  # Calculate MAPE (Mean Absolute Percentage Error)
+  mape <- mean(abs((test_data$life_expect - predictions) / test_data$life_expect)) * 100
+  
+  # Print the metrics
+  cat("RMSE:", rmse, "\n")
+  cat("R-squared:", r_squared, "\n")
+  cat("MAPE:", mape, "%\n")
+}
+```
+
+```{r}
+# Simple decision tree with original data
+who_original <- who
+# Dependent variables are removed
+who_original$adult_mortality <- NULL
+who_original$infant_mort <- NULL
+who_original$age1.4mort <- NULL
+who_original$life_exp60 <- NULL
+who_original$une_life <- NULL
+who_original$une_infant <- NULL
+
+# We randomized the dataset so we won't be training the model with countries from same region but test the model on countries from other regions, as the dataset was grouped by countries and regions. This might lead to overfiting, although not necessarily. 
+set.seed(999)
+random_indices <- sample(nrow(who_original))
+who_original_randomized <- who_original[random_indices, ]
+
+# Splitting the training set and testing set
+split_index <- createDataPartition(who_original_randomized$life_expect, p = .8, list = FALSE)
+train_data <- who_original_randomized[split_index, ]
+test_data <- who_original_randomized[-split_index, ]
+
+# Remove categorical columns and year from training and testing
+train_data <- subset(train_data, select = -c(country, country_code, region, year))
+test_data <- subset(test_data, select = -c(country, country_code, region, year))
+
+# Train the decision tree
+decision_tree_model <- rpart(life_expect ~ ., data = train_data, method = "anova")
+predictions <- predict(decision_tree_model, test_data)
+
+#Calculate RMSE, R^2, and MAPE
+calculate_metrics(predictions,test_data)
+
+# Plot the tree
+rpart.plot(decision_tree_model, type = 0, extra = 1, under = TRUE, faclen = 0)
+title("Simple Decision Tree (who_original)")
+```
+
+```{r}
+# Simple decision tree with cleaned data
+# Same as above, randomize the dataset
+set.seed(999)
+random_indices <- sample(nrow(who_cleaned))
+who_cleaned_randomized <- who_cleaned_no_categorical[random_indices, ]
+
+# Split training and testing 
+split_index <- createDataPartition(who_cleaned_randomized$life_expect, p = .8, list = FALSE)
+train_data <- who_cleaned_randomized[split_index, ]
+test_data <- who_cleaned_randomized[-split_index, ]
+
+# Train the tree model 
+decision_tree_model <- rpart(life_expect ~ ., data = train_data, method = "anova")
+predictions <- predict(decision_tree_model, test_data)
+
+#Calculate RMSE, R^2, and MAPE
+calculate_metrics(predictions,test_data)
+
+# Plot the tree
+rpart.plot(decision_tree_model, type = 0, extra = 1, under = TRUE, faclen = 0)
+title("Simple Decision Tree (who_cleaned)")
+```
+
+```{r}
+## Tuned decision tree with cleaned data set
+
+# Split training and testing
+split_index <- createDataPartition(who_cleaned_randomized$life_expect, p = .8, list = FALSE)
+train_data <- who_cleaned_randomized[split_index, ]
+test_data <- who_cleaned_randomized[-split_index, ]
+
+# The method would be cross validation, with 10 folds and grid search
+# Grid search is a hyperparameter tuning technique
+trainControl <- trainControl(method = "cv", number = 10, search = "grid")
+
+# Define a grid
+# cp = seq(0, 0.1, 0.001) was also tested but the result is too complicated. 
+# This grid value is well balanced
+tuneGrid <- expand.grid(cp = seq(0.001, 0.1, length.out = 10))
+
+# Train the model with the corrected tuneGrid
+tuned_decision_tree <- train(life_expect ~ ., data = train_data,
+                             method = "rpart",
+                             trControl = trainControl,
+                             tuneGrid = tuneGrid)
+
+# Predictions and model evaluation
+predictions <- predict(tuned_decision_tree, test_data)
+
+#Calculate RMSE, R^2, and MAPE
+calculate_metrics(predictions,test_data)
+
+# Plot the final model
+final_rpart_model <- tuned_decision_tree$finalModel
+rpart.plot(final_rpart_model, type = 0, extra = 1, under = TRUE, faclen = 0)
+title("Tuned Decision Tree (who_cleaned)")
+```
+
+
+```{r}
+## Random Forest
+
+# Split the training and testing 
+splitIndex <- createDataPartition(who_cleaned_randomized$life_expect, p = .8, list = FALSE)
+train_data <- who_cleaned_randomized[splitIndex, ]
+test_data <- who_cleaned_randomized[-splitIndex, ]
+
+# Fit Random Forest model
+rf <- randomForest(life_expect ~ ., data = train_data, ntree = 500)
+
+# Predict on test data
+predictions <- predict(rf, test_data)
+
+#Calculate RMSE, R^2, and MAPE
+calculate_metrics(predictions,test_data)
+
+# Plot the Variable Importance graph
+var_importance <- importance(rf)
+var_importance_df <- data.frame(
+  Variable = rownames(var_importance),
+  Importance = var_importance[,1]  # Assuming you want the first measure of importance; adjust if necessary
+)
+
+ggplot(var_importance_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +  # Horizontal graph for better view
+  labs(title = "Variable Importance in the Random Forest Model",
+       x = "Variable",
+       y = "Importance") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))  # Centers the title
+```
+
+```{r}
+## Gradient boosting
+
+# Splitting training and testing
+splitIndex <- createDataPartition(who_cleaned_randomized$life_expect, p = .8, list = FALSE)
+train_data <- who_cleaned_randomized[splitIndex, ]
+test_data <- who_cleaned_randomized[-splitIndex, ]
+
+# Train the model
+gbm_model <- gbm(life_expect ~ ., 
+                 data = train_data, 
+                 distribution = "gaussian", # The error distribution will be Gaussian
+# Number of trees. A too large number will possibly cause overfiting and won't be necessary in improving the prediction accuracy
+                 n.trees = 1000, 
+                 interaction.depth = 10, # Maximum depth for each tree
+                 shrinkage = 0.01, # Learning rate
+                 cv.folds = 10, # NUmber of folds in validation
+                 n.minobsinnode = 10) # Minimum observation in each node
+summary(gbm_model)
+
+# Make predictions 
+predictions <- predict(gbm_model, newdata = test_data, n.trees = 500, type = "response")
+
+# Plot the Variable Importance graph
+var_importance <- summary(gbm_model, n.trees = 500, plot = FALSE)
+var_importance_df <- as.data.frame(var_importance)
+
+ggplot(var_importance_df, aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +  # Horizontal graph for better view
+  labs(title = "Variable Importance in the GBM Model",
+       x = "Variable",
+       y = "Importance") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))  # Centers the title
+
+#Calculate RMSE, R^2, and MAPE
+calculate_metrics(predictions,test_data)
+```
+
+
+
+
+
+
